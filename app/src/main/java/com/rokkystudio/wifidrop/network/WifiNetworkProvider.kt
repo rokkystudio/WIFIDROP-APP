@@ -60,8 +60,11 @@ class WifiNetworkProvider(
      */
     private fun findWifiNetwork(): Network? {
         val activeNetwork = connectivityManager.activeNetwork
-        if (activeNetwork != null && activeNetwork.hasWifiTransport(connectivityManager)) {
-            return activeNetwork
+        if (activeNetwork != null) {
+            val capabilities = connectivityManager.getNetworkCapabilities(activeNetwork)
+            if (capabilities?.isUsableWifiNetwork() == true) {
+                return activeNetwork
+            }
         }
         return awaitWifiNetwork()
     }
@@ -72,11 +75,16 @@ class WifiNetworkProvider(
     private fun awaitWifiNetwork(): Network? {
         val request = NetworkRequest.Builder()
             .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
             .build()
         val selectedNetwork = AtomicReference<Network?>()
         val latch = CountDownLatch(1)
         val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
+                val capabilities = connectivityManager.getNetworkCapabilities(network) ?: return
+                if (!capabilities.isUsableWifiNetwork()) {
+                    return
+                }
                 selectedNetwork.compareAndSet(null, network)
                 latch.countDown()
             }
@@ -89,7 +97,10 @@ class WifiNetworkProvider(
         registerWifiCallback(request, callback)
         return try {
             latch.await(WIFI_CALLBACK_TIMEOUT_MS, TimeUnit.MILLISECONDS)
-            selectedNetwork.get()
+            selectedNetwork.get()?.takeIf {
+                val capabilities = connectivityManager.getNetworkCapabilities(it)
+                capabilities?.isUsableWifiNetwork() == true
+            }
         } finally {
             runCatching {
                 connectivityManager.unregisterNetworkCallback(callback)
@@ -127,9 +138,10 @@ class WifiNetworkProvider(
     /**
      * Проверяет наличие Wi‑Fi транспорта у сети Android.
      */
-    private fun Network.hasWifiTransport(connectivityManager: ConnectivityManager): Boolean {
-        val capabilities = connectivityManager.getNetworkCapabilities(this) ?: return false
-        return capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
+    private fun NetworkCapabilities.isUsableWifiNetwork(): Boolean {
+        return hasTransport(NetworkCapabilities.TRANSPORT_WIFI) &&
+            hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN) &&
+            !hasTransport(NetworkCapabilities.TRANSPORT_VPN)
     }
 
     /**

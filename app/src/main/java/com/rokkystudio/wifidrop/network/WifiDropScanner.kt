@@ -12,15 +12,29 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Выполняет HTTP-поиск Windows WiFiDrop Server в Wi‑Fi подсети устройства.
  */
 class WifiDropScanner {
     /**
+     * Сообщает о прогрессе IP-сканирования подсети.
+     */
+    data class ScanProgress(
+        val currentHost: String,
+        val scannedHosts: Int,
+        val totalHosts: Int,
+        val foundServers: Int,
+    )
+
+    /**
      * Сканирует подсеть и возвращает найденные Windows-серверы.
      */
-    fun scan(wifiInfo: WifiNetworkProvider.WifiNetworkInfo): List<WindowsServer> {
+    fun scan(
+        wifiInfo: WifiNetworkProvider.WifiNetworkInfo,
+        onProgress: ((ScanProgress) -> Unit)? = null,
+    ): List<WindowsServer> {
         val candidateHosts = buildCandidateHosts(wifiInfo.ipv4Address, wifiInfo.prefixLength)
         if (candidateHosts.size > MAX_SCAN_HOSTS) {
             throw WiFiDropError.UnknownError("Подсеть Wi‑Fi слишком большая для быстрого поиска сервера").asException()
@@ -36,6 +50,7 @@ class WifiDropScanner {
             .build()
 
         val results = ConcurrentHashMap<String, WindowsServer>()
+        val scannedHosts = AtomicInteger(0)
         val executor = Executors.newFixedThreadPool(minOf(MAX_PARALLEL_REQUESTS, candidateHosts.size.coerceAtLeast(1)))
         try {
             val futures = ArrayList<Future<*>>(candidateHosts.size)
@@ -44,6 +59,14 @@ class WifiDropScanner {
                     fetchServer(client, host)?.let { server ->
                         results.putIfAbsent(server.host, server)
                     }
+                    onProgress?.invoke(
+                        ScanProgress(
+                            currentHost = host,
+                            scannedHosts = scannedHosts.incrementAndGet(),
+                            totalHosts = candidateHosts.size,
+                            foundServers = results.size,
+                        ),
+                    )
                 }
             }
             futures.forEach { it.get() }
@@ -87,6 +110,7 @@ class WifiDropScanner {
             if (error is WiFiDropError.LocalNetworkBlocked) {
                 throw error.asException(throwable)
             }
+            Log.d(LOG_TAG, "HTTP scan request failed for $host:$DEFAULT_HTTP_PORT", throwable)
             null
         }
     }
@@ -171,7 +195,7 @@ class WifiDropScanner {
         const val DEFAULT_HTTP_PORT = 49231
         const val CONNECT_TIMEOUT_MS = 300L
         const val READ_TIMEOUT_MS = 500L
-        const val MAX_PARALLEL_REQUESTS = 64
+        const val MAX_PARALLEL_REQUESTS = 24
         const val MAX_SCAN_HOSTS = 4096
         const val IPV4_MASK = 0xFFFFFFFFL
     }
