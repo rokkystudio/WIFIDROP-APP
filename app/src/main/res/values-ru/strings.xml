@@ -1,0 +1,22 @@
+<resources>
+    <string name="app_name">WiFiDrop</string>
+    <string name="main_activity_stage_one_description">Этап 1 выполняет отправку файлов из Android Share menu в Windows WiFiDrop Server по локальной сети Wi‑Fi.</string>
+    <string name="share_activity_title">WiFiDrop Share</string>
+    <string name="share_status_preparing">Подготовка передачи…</string>
+    <string name="share_status_scanning">Поиск Windows-серверов WiFiDrop…</string>
+    <string name="share_status_select_server">Выберите Windows-сервер</string>
+    <string name="share_status_uploading">Отправка файлов на %1$s…</string>
+    <string name="share_status_error_title">Передача не выполнена</string>
+    <string name="share_error_server_not_found">Сервер WiFiDrop не найден в локальной сети</string>
+    <string name="share_error_no_files">Файлы для передачи не найдены</string>
+    <string name="share_error_empty_name">Не удалось определить имя файла</string>
+    <string name="share_error_large_subnet">Подсеть Wi‑Fi слишком большая для быстрого поиска сервера</string>
+    <string name="share_error_local_network_blocked">VPN запрещает передачу через локальную сеть</string>
+    <string name="share_error_wifi_only">Передача доступна только по Wi‑Fi</string>
+    <string name="share_action_retry">Повторить</string>
+    <string name="share_action_close">Закрыть</string>
+    <string name="share_result_single">Файл отправлен</string>
+    <string name="share_result_multiple">Отправлено файлов: %1$d</string>
+    <string name="share_server_row_title">%1$s</string>
+    <string name="share_server_row_subtitle">%1$s:%2$d</string>
+</resources>
