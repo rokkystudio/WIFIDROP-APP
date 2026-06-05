@@ -16,8 +16,16 @@
     <string name="main_status_disconnected_detail">Android-устройство больше не публикуется в приложении Windows.</string>
     <string name="main_status_error_title">Подключение не выполнено</string>
     <string name="main_action_disconnect">Отключить</string>
+    <string name="service_action_disconnect">Отключить</string>
+    <string name="service_notification_channel_name">Подключение WiFiDrop</string>
+    <string name="service_notification_channel_description">Удерживает доступ к хранилищу Android для Windows.</string>
+    <string name="service_notification_connecting_title">WiFiDrop подключается</string>
+    <string name="service_notification_connecting_text">Подключение к %1$s и запуск WebDAV.</string>
+    <string name="service_notification_connected_title">WiFiDrop активен</string>
+    <string name="service_notification_connected_text">Хранилище Android подключено к %1$s.</string>
     <string name="main_storage_roots_title">Корни хранилища</string>
-    <string name="main_error_no_storage_roots_ready">Перед подключением к Windows откройте доступ хотя бы к одному корню хранилища.</string>
+    <string name="main_error_no_storage_roots_ready">Перед подключением к Windows откройте доступ ко всем файлам.</string>
+    <string name="main_storage_access_denied">Доступ ко всем файлам не предоставлен. WiFiDrop будет закрыт.</string>
     <string name="main_stats_wifi_ip">Wi‑Fi IP: %1$s</string>
     <string name="main_stats_prefix">Префикс: /%1$d</string>
     <string name="main_stats_port">Порт сканирования: %1$d</string>
@@ -38,7 +46,7 @@
     <string name="storage_state_ready_rw">доступно на чтение и запись</string>
     <string name="storage_state_ready_ro">доступно только на чтение</string>
     <string name="storage_state_needs_all_files">нужен доступ ко всем файлам</string>
-    <string name="storage_state_needs_tree_grant">нужно выдать доступ к тому</string>
+    <string name="storage_state_needs_tree_grant">нужен доступ ко всем файлам</string>
     <string name="storage_state_unavailable">хранилище недоступно</string>
     <string name="share_activity_title">WiFiDrop Share</string>
     <string name="share_status_preparing">Подготовка передачи…</string>

@@ -61,7 +61,7 @@ class WindowsControlClient(
             .put("webDavPort", webDavEndpoint.port)
             .put("webDavBasePath", webDavEndpoint.basePath)
             .put("mountReady", webDavEndpoint.mountReady)
-            .put("readOnly", true)
+            .put("readOnly", false)
             .toString()
             .toRequestBody(JSON_MEDIA_TYPE)
 

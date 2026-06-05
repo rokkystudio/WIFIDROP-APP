@@ -1,24 +1,31 @@
 package com.rokkystudio.wifidrop
 
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
+import android.os.Build
 import android.os.Bundle
 import android.view.View
 import android.widget.ListView
 import android.widget.ProgressBar
 import android.widget.TextView
+import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.enableEdgeToEdge
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
-import com.rokkystudio.wifidrop.network.AndroidWebDavServer
 import com.rokkystudio.wifidrop.network.WifiDropScanner
 import com.rokkystudio.wifidrop.network.WifiNetworkProvider
-import com.rokkystudio.wifidrop.network.WindowsControlClient
 import com.rokkystudio.wifidrop.network.WindowsServer
 import com.rokkystudio.wifidrop.storage.StorageAccessState
 import com.rokkystudio.wifidrop.storage.StorageRootEntry
 import com.rokkystudio.wifidrop.storage.StorageRootsRepository
+import com.rokkystudio.wifidrop.service.AndroidConnectionService
+import com.rokkystudio.wifidrop.service.ConnectionServicePhase
+import com.rokkystudio.wifidrop.service.ConnectionServiceSnapshot
+import com.rokkystudio.wifidrop.service.ConnectionServiceStateStore
 import com.rokkystudio.wifidrop.ui.ShareServerPickerScreen
 import com.rokkystudio.wifidrop.ui.StorageRootsScreen
 import java.util.concurrent.ExecutorService
@@ -42,30 +49,33 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var wifiNetworkProvider: WifiNetworkProvider
     private lateinit var wifiDropScanner: WifiDropScanner
-    private lateinit var windowsControlClient: WindowsControlClient
     private lateinit var storageRootsRepository: StorageRootsRepository
-    private lateinit var webDavServer: AndroidWebDavServer
+    private lateinit var connectionStateStore: ConnectionServiceStateStore
     private lateinit var serverPickerScreen: ShareServerPickerScreen
     private lateinit var storageRootsScreen: StorageRootsScreen
 
     private var lastWifiInfo: WifiNetworkProvider.WifiNetworkInfo? = null
     private var lastStorageRoots: List<StorageRootEntry> = emptyList()
+    private var discoveredServers: List<WindowsServer> = emptyList()
+    private var scanGeneration = 0
+    private var waitingForInitialStorageGrant = false
+    private var connectionReceiverRegistered = false
     @Volatile
     private var disconnectRequested = false
-    private val openDocumentTreeLauncher =
-        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
-            val uri = result.data?.data ?: run {
-                refreshStorageRootsState()
-                return@registerForActivityResult
-            }
-            val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
-            contentResolver.takePersistableUriPermission(uri, flags)
-            storageRootsRepository.saveTreeUri(uri)
-            refreshStorageRootsState()
+    private val connectionStateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            renderConnectionState(connectionStateStore.read())
         }
+    }
     private val manageAllFilesAccessLauncher =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
-            refreshStorageRootsState()
+            if (storageRootsRepository.hasAllFilesAccess()) {
+                waitingForInitialStorageGrant = false
+                continueAfterStorageAccess()
+            } else {
+                Toast.makeText(this, R.string.main_storage_access_denied, Toast.LENGTH_SHORT).show()
+                finishAndRemoveTask()
+            }
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -81,14 +91,29 @@ class MainActivity : AppCompatActivity() {
         bindViews()
         bindDependencies()
         bindActions()
-        refreshStorageRootsState()
-        startDiscoveryFlow()
+        if (ensureStorageAccessGranted()) {
+            continueAfterStorageAccess()
+        }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        registerConnectionStateReceiver()
+        val snapshot = connectionStateStore.read()
+        if (snapshot.phase != ConnectionServicePhase.IDLE) {
+            renderConnectionState(snapshot)
+        }
+    }
+
+    override fun onStop() {
+        if (connectionReceiverRegistered) {
+            unregisterReceiver(connectionStateReceiver)
+            connectionReceiverRegistered = false
+        }
+        super.onStop()
     }
 
     override fun onDestroy() {
-        disconnectRequested = true
-        windowsControlClient.disconnect()
-        webDavServer.stop()
         executor.shutdownNow()
         super.onDestroy()
     }
@@ -107,9 +132,8 @@ class MainActivity : AppCompatActivity() {
     private fun bindDependencies() {
         wifiNetworkProvider = WifiNetworkProvider(applicationContext)
         wifiDropScanner = WifiDropScanner()
-        windowsControlClient = WindowsControlClient(applicationContext)
         storageRootsRepository = StorageRootsRepository(applicationContext)
-        webDavServer = AndroidWebDavServer(applicationContext)
+        connectionStateStore = ConnectionServiceStateStore(applicationContext)
         serverPickerScreen = ShareServerPickerScreen(
             context = this,
             listView = serverListView,
@@ -128,16 +152,42 @@ class MainActivity : AppCompatActivity() {
         }
         disconnectButton.setOnClickListener {
             disconnectRequested = true
-            windowsControlClient.disconnect()
-            webDavServer.stop()
+            AndroidConnectionService.stop(this)
             showDisconnected()
         }
     }
 
+    private fun continueAfterStorageAccess() {
+        refreshStorageRootsState()
+        val snapshot = connectionStateStore.read()
+        if (snapshot.isActive) {
+            renderConnectionState(snapshot)
+        } else {
+            startDiscoveryFlow()
+        }
+    }
+
+    private fun ensureStorageAccessGranted(): Boolean {
+        if (storageRootsRepository.hasAllFilesAccess()) {
+            return true
+        }
+        waitingForInitialStorageGrant = true
+        manageAllFilesAccessLauncher.launch(storageRootsRepository.buildManageAllFilesAccessIntent())
+        return false
+    }
+
     private fun startDiscoveryFlow() {
+        val snapshot = connectionStateStore.read()
+        if (snapshot.isActive) {
+            renderConnectionState(snapshot)
+            return
+        }
+        if (!ensureStorageAccessGranted()) {
+            return
+        }
+        val generation = ++scanGeneration
+        discoveredServers = emptyList()
         disconnectRequested = false
-        windowsControlClient.disconnect()
-        webDavServer.stop()
         refreshStorageRootsState()
         showLoading(getString(R.string.main_status_preparing), null, null)
         executor.execute {
@@ -145,6 +195,9 @@ class MainActivity : AppCompatActivity() {
                 val wifiInfo = wifiNetworkProvider.getWifiNetworkInfo()
                 lastWifiInfo = wifiInfo
                 runOnUiThread {
+                    if (generation != scanGeneration) {
+                        return@runOnUiThread
+                    }
                     showLoading(
                         getString(R.string.main_status_scanning),
                         buildNetworkStats(
@@ -157,20 +210,43 @@ class MainActivity : AppCompatActivity() {
                         getString(R.string.main_status_scanning_detail),
                     )
                 }
-                val servers = wifiDropScanner.scan(wifiInfo) { progress ->
-                    runOnUiThread {
-                        statusText.text = getString(R.string.main_status_scanning)
-                        statsText.text = buildNetworkStats(
-                            wifiInfo = wifiInfo,
-                            currentHost = progress.currentHost,
-                            scannedHosts = progress.scannedHosts,
-                            totalHosts = progress.totalHosts,
-                            foundServers = progress.foundServers,
-                        )
-                        detailText.text = getString(R.string.main_status_scanning_host, progress.currentHost)
-                    }
-                }
+                val servers = wifiDropScanner.scan(
+                    wifiInfo = wifiInfo,
+                    onProgress = { progress ->
+                        runOnUiThread {
+                            if (generation != scanGeneration) {
+                                return@runOnUiThread
+                            }
+                            renderScanningState(wifiInfo, progress, discoveredServers)
+                        }
+                    },
+                    onServerFound = { servers ->
+                        runOnUiThread {
+                            if (generation != scanGeneration) {
+                                return@runOnUiThread
+                            }
+                            discoveredServers = servers
+                            serverPickerScreen.show(servers)
+                            serverListView.visibility = View.VISIBLE
+                            statsText.text = buildNetworkStats(
+                                wifiInfo = wifiInfo,
+                                currentHost = null,
+                                scannedHosts = null,
+                                totalHosts = null,
+                                foundServers = servers.size,
+                            )
+                        }
+                    },
+                    shouldContinue = {
+                        generation == scanGeneration &&
+                            !disconnectRequested &&
+                            connectionStateStore.read().phase == ConnectionServicePhase.IDLE
+                    },
+                )
                 runOnUiThread {
+                    if (generation != scanGeneration) {
+                        return@runOnUiThread
+                    }
                     handleDiscoveredServers(wifiInfo, servers)
                 }
             } catch (throwable: Throwable) {
@@ -178,9 +254,35 @@ class MainActivity : AppCompatActivity() {
                     WiFiDropError.UnknownError(getString(R.string.main_status_error_title)),
                 )
                 runOnUiThread {
+                    if (generation != scanGeneration) {
+                        return@runOnUiThread
+                    }
                     handleError(error)
                 }
             }
+        }
+    }
+
+    private fun renderScanningState(
+        wifiInfo: WifiNetworkProvider.WifiNetworkInfo,
+        progress: WifiDropScanner.ScanProgress,
+        servers: List<WindowsServer>,
+    ) {
+        statusText.text = getString(R.string.main_status_scanning)
+        statsText.text = buildNetworkStats(
+            wifiInfo = wifiInfo,
+            currentHost = progress.currentHost,
+            scannedHosts = progress.scannedHosts,
+            totalHosts = progress.totalHosts,
+            foundServers = progress.foundServers,
+        )
+        detailText.text = getString(R.string.main_status_scanning_host, progress.currentHost)
+        progressBar.visibility = View.VISIBLE
+        retryButton.visibility = View.GONE
+        disconnectButton.visibility = View.GONE
+        serverListView.visibility = if (servers.isEmpty()) View.GONE else View.VISIBLE
+        if (servers.isNotEmpty()) {
+            serverPickerScreen.show(servers)
         }
     }
 
@@ -193,6 +295,7 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
+        discoveredServers = servers
         statusText.text = getString(R.string.main_status_select_server)
         statsText.text = buildNetworkStats(
             wifiInfo = wifiInfo,
@@ -221,92 +324,59 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
+        scanGeneration++
         disconnectRequested = false
-        showLoading(
-            getString(R.string.main_status_connecting, server.deviceName),
-            buildNetworkStats(
-                wifiInfo = wifiInfo,
-                currentHost = server.host,
-                scannedHosts = null,
-                totalHosts = null,
-                foundServers = null,
+        AndroidConnectionService.start(this, server)
+        renderConnectionState(
+            ConnectionServiceSnapshot(
+                phase = ConnectionServicePhase.CONNECTING,
+                serverName = server.deviceName,
+                serverHost = server.host,
+                serverPort = server.tcpPort,
+                detailMessage = getString(R.string.main_status_connecting_detail, server.host, server.tcpPort),
             ),
-            getString(R.string.main_status_connecting_detail, server.host, server.tcpPort),
         )
-        executor.execute {
-            try {
-                val runningWebDav = webDavServer.start(wifiInfo, publishedRoots)
-                val mountReady = runningWebDav.host.isNotBlank() && runningWebDav.port > 0
-                val session = windowsControlClient.connect(
-                    wifiInfo = wifiInfo,
-                    server = server,
-                    webDavEndpoint = WindowsControlClient.WebDavEndpoint(
-                        host = runningWebDav.host,
-                        port = runningWebDav.port,
-                        basePath = runningWebDav.basePath,
-                        mountReady = mountReady,
-                    ),
-                )
-                runOnUiThread {
-                    showConnected(server, session.driveName, runningWebDav)
-                }
-                windowsControlClient.runSession(wifiInfo, server, session.clientId)
-                webDavServer.stop()
-                runOnUiThread {
-                    if (disconnectRequested) {
-                        showDisconnected()
-                    } else {
-                        handleError(
-                            WiFiDropError.WindowsRejectedConnection(
-                                getString(R.string.main_status_session_closed, server.deviceName),
-                            ),
-                        )
-                    }
-                }
-            } catch (throwable: Throwable) {
-                webDavServer.stop()
-                if (disconnectRequested) {
-                    runOnUiThread { showDisconnected() }
-                    return@execute
-                }
-
-                val error = throwable.toWiFiDropError(
-                    WiFiDropError.WindowsRejectedConnection(getString(R.string.main_status_error_title)),
-                )
-                runOnUiThread {
-                    handleError(error)
-                }
-            }
-        }
     }
 
-    private fun showConnected(
-        server: WindowsServer,
-        driveName: String,
-        runningWebDav: AndroidWebDavServer.RunningServer,
-    ) {
-        statusText.text = getString(R.string.main_status_connected, server.deviceName)
-        statsText.text = buildConnectedStats(server, runningWebDav)
-        detailText.text = getString(
-            R.string.main_status_connected_detail,
-            driveName,
-            server.host,
-            server.tcpPort,
-        )
-        progressBar.visibility = View.GONE
-        serverListView.visibility = View.GONE
-        retryButton.visibility = View.GONE
-        disconnectButton.visibility = View.VISIBLE
-    }
-
-    private fun showDisconnected() {
+    private fun showDisconnected(detailMessage: String? = null) {
         statusText.text = getString(R.string.main_status_disconnected)
         statsText.text = buildIdleStats()
-        detailText.text = getString(R.string.main_status_disconnected_detail)
+        detailText.text = detailMessage ?: getString(R.string.main_status_disconnected_detail)
         progressBar.visibility = View.GONE
         serverListView.visibility = View.GONE
         retryButton.visibility = View.VISIBLE
         disconnectButton.visibility = View.GONE
+    }
+
+    private fun renderConnectionState(snapshot: ConnectionServiceSnapshot) {
+        when (snapshot.phase) {
+            ConnectionServicePhase.IDLE -> showDisconnected(snapshot.detailMessage)
+            ConnectionServicePhase.CONNECTING -> {
+                showLoading(
+                    getString(R.string.main_status_connecting, snapshot.serverName.orEmpty()),
+                    buildConnectingStats(snapshot),
+                    snapshot.detailMessage,
+                )
+            }
+
+            ConnectionServicePhase.CONNECTED -> {
+                statusText.text = getString(R.string.main_status_connected, snapshot.serverName.orEmpty())
+                statsText.text = buildConnectedStats(snapshot)
+                detailText.text = snapshot.detailMessage
+                progressBar.visibility = View.GONE
+                serverListView.visibility = View.GONE
+                retryButton.visibility = View.GONE
+                disconnectButton.visibility = View.VISIBLE
+            }
+
+            ConnectionServicePhase.ERROR -> {
+                handleError(
+                    WiFiDropError.WindowsRejectedConnection(
+                        snapshot.errorMessage ?: getString(R.string.main_status_error_title),
+                    ),
+                )
+            }
+        }
     }
 
     private fun handleError(error: WiFiDropError) {
@@ -356,19 +426,33 @@ class MainActivity : AppCompatActivity() {
         return lines.joinToString("\n")
     }
 
-    private fun buildConnectedStats(
-        server: WindowsServer,
-        runningWebDav: AndroidWebDavServer.RunningServer,
-    ): String {
+    private fun buildConnectingStats(snapshot: ConnectionServiceSnapshot): String? {
+        val lines = mutableListOf<String>()
         val wifiInfo = lastWifiInfo
+        if (wifiInfo != null) {
+            lines += getString(R.string.main_stats_wifi_ip, wifiInfo.ipv4Address.hostAddress.orEmpty())
+            lines += getString(R.string.main_stats_prefix, wifiInfo.prefixLength)
+        }
+        if (!snapshot.serverHost.isNullOrBlank()) {
+            lines += getString(R.string.main_stats_server_host, snapshot.serverHost)
+        }
+        if (snapshot.serverPort > 0) {
+            lines += getString(R.string.main_stats_server_port, snapshot.serverPort)
+        }
+        lines += buildStorageStatsLines()
+        return lines.takeIf { it.isNotEmpty() }?.joinToString("\n")
+    }
+
+    private fun buildConnectedStats(snapshot: ConnectionServiceSnapshot): String {
         val lines = mutableListOf(
-            getString(R.string.main_stats_server_host, server.host),
-            getString(R.string.main_stats_server_port, server.tcpPort),
-            getString(R.string.main_stats_webdav_port, runningWebDav.port),
+            getString(R.string.main_stats_server_host, snapshot.serverHost.orEmpty()),
+            getString(R.string.main_stats_server_port, snapshot.serverPort),
+            getString(R.string.main_stats_webdav_port, snapshot.webDavPort),
         )
-        lines += runningWebDav.rootDisplayNames.map { rootName ->
+        lines += snapshot.rootDisplayNames.map { rootName ->
             getString(R.string.main_stats_storage_root_item, rootName)
         }
+        val wifiInfo = lastWifiInfo
         if (wifiInfo != null) {
             lines.add(0, getString(R.string.main_stats_wifi_ip, wifiInfo.ipv4Address.hostAddress.orEmpty()))
             lines.add(1, getString(R.string.main_stats_prefix, wifiInfo.prefixLength))
@@ -400,12 +484,9 @@ class MainActivity : AppCompatActivity() {
     private fun handleStorageRootSelected(root: StorageRootEntry) {
         when (root.accessState) {
             StorageAccessState.READY -> Unit
-            StorageAccessState.NEEDS_ALL_FILES_ACCESS -> {
-                manageAllFilesAccessLauncher.launch(storageRootsRepository.buildManageAllFilesAccessIntent())
-            }
-
+            StorageAccessState.NEEDS_ALL_FILES_ACCESS,
             StorageAccessState.NEEDS_TREE_GRANT -> {
-                openDocumentTreeLauncher.launch(storageRootsRepository.buildGrantTreeIntent(root))
+                manageAllFilesAccessLauncher.launch(storageRootsRepository.buildManageAllFilesAccessIntent())
             }
 
             StorageAccessState.UNAVAILABLE -> {
@@ -417,18 +498,14 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun buildStorageStatsLines(): List<String> {
-        if (lastStorageRoots.isEmpty()) {
+        if (lastStorageRoots.isEmpty() || !storageRootsRepository.hasAllFilesAccess()) {
             return emptyList()
         }
 
         val readyRoots = lastStorageRoots.filter { it.accessState == StorageAccessState.READY }
-        val pendingRoots = lastStorageRoots.count { it.accessState != StorageAccessState.READY }
         val lines = mutableListOf(
             getString(R.string.main_stats_storage_ready, readyRoots.size, lastStorageRoots.size),
         )
-        if (pendingRoots > 0) {
-            lines += getString(R.string.main_stats_storage_pending, pendingRoots)
-        }
         lines += readyRoots.map { root ->
             getString(R.string.main_stats_storage_root_item, root.displayName)
         }
@@ -437,5 +514,19 @@ class MainActivity : AppCompatActivity() {
 
     private companion object {
         const val SERVER_SCAN_PORT = 49231
+    }
+
+    private fun registerConnectionStateReceiver() {
+        if (connectionReceiverRegistered) {
+            return
+        }
+        val filter = IntentFilter(AndroidConnectionService.ACTION_STATE_CHANGED)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(connectionStateReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("DEPRECATION")
+            registerReceiver(connectionStateReceiver, filter)
+        }
+        connectionReceiverRegistered = true
     }
 }

@@ -25,6 +25,7 @@ import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketException
+import java.net.SocketTimeoutException
 import java.net.URLDecoder
 import java.nio.charset.StandardCharsets
 import java.text.SimpleDateFormat
@@ -171,16 +172,40 @@ class AndroidWebDavServer(
             client.soTimeout = SOCKET_TIMEOUT_MS
             val input = BufferedInputStream(client.getInputStream())
             val output = BufferedOutputStream(client.getOutputStream())
-            val request = parseRequest(input) ?: run {
+            val request = try {
+                parseRequest(input)
+            } catch (_: SocketTimeoutException) {
+                Log.d(LOG_TAG, "WebDAV request read timed out")
+                return
+            } catch (_: EOFException) {
+                return
+            } catch (throwable: Throwable) {
+                Log.d(LOG_TAG, "WebDAV request parse failed", throwable)
+                writeSimpleResponse(output, 400, "Bad Request", "text/plain; charset=utf-8", "Bad Request".toByteArray())
+                return
+            } ?: run {
                 writeSimpleResponse(output, 400, "Bad Request", "text/plain; charset=utf-8", "Bad Request".toByteArray())
                 return
             }
+            Log.d(
+                LOG_TAG,
+                "WebDAV request ${request.method} ${request.path} host=${request.headers["host"].orEmpty()} " +
+                    "depth=${request.headers["depth"].orEmpty()} auth=${request.headers.containsKey("authorization")}",
+            )
 
             try {
                 when (request.method) {
                     "OPTIONS" -> handleOptions(output)
                     "PROPFIND" -> handlePropFind(output, request)
-                    "GET" -> handleGet(output, request, sendBody = true)
+                    "GET" -> {
+                        if (request.path == API_META_PATH) {
+                            handleApiMeta(output, request)
+                        } else if (request.path == API_LIST_PATH) {
+                            handleApiList(output, request)
+                        } else {
+                            handleGet(output, request, sendBody = true)
+                        }
+                    }
                     "HEAD" -> handleGet(output, request, sendBody = false)
                     "PUT" -> handlePut(output, request, input)
                     "DELETE" -> handleDelete(output, request)
@@ -200,8 +225,10 @@ class AndroidWebDavServer(
     private fun handleOptions(output: BufferedOutputStream) {
         val headers = linkedMapOf(
             "Allow" to "OPTIONS, PROPFIND, GET, HEAD, PUT, DELETE, MKCOL, MOVE, LOCK, UNLOCK",
+            "Public" to "OPTIONS, PROPFIND, GET, HEAD, PUT, DELETE, MKCOL, MOVE, LOCK, UNLOCK",
             "DAV" to "1, 2",
             "MS-Author-Via" to "DAV",
+            "Accept-Ranges" to "bytes",
             "Content-Length" to "0",
         )
         writeResponse(output, 200, "OK", headers, null)
@@ -215,12 +242,17 @@ class AndroidWebDavServer(
         }
 
         val depth = request.headers["depth"] ?: "infinity"
-        val responseXml = buildMultiStatusXml(target, includeChildren = depth != "0")
+        val responseXml = buildMultiStatusXml(
+            target = target,
+            includeChildren = depth != "0",
+            requestBaseUrl = buildRequestBaseUrl(request),
+        )
             .toByteArray(StandardCharsets.UTF_8)
         val headers = linkedMapOf(
-            "Content-Type" to "application/xml; charset=utf-8",
+            "Content-Type" to "text/xml; charset=utf-8",
             "DAV" to "1, 2",
             "MS-Author-Via" to "DAV",
+            "Accept-Ranges" to "bytes",
             "Content-Length" to responseXml.size.toString(),
         )
         writeResponse(output, 207, "Multi-Status", headers, responseXml)
@@ -233,25 +265,168 @@ class AndroidWebDavServer(
             return
         }
         if (node.isDirectory) {
-            writeSimpleResponse(output, 405, "Method Not Allowed", "text/plain; charset=utf-8", ByteArray(0))
+            val body = buildDirectoryListingHtml(node)
+                .toByteArray(StandardCharsets.UTF_8)
+            val headers = linkedMapOf(
+                "Content-Type" to "text/html; charset=utf-8",
+                "Content-Length" to body.size.toString(),
+            )
+            writeResponseHeaders(output, 200, "OK", headers)
+            if (sendBody) {
+                output.write(body)
+            }
+            output.flush()
             return
         }
 
         val length = node.contentLength().coerceAtLeast(0L)
+        val requestedRange = request.headers["range"]?.let { parseByteRange(it, length) }
+        if (request.headers.containsKey("range") && requestedRange == null) {
+            val headers = linkedMapOf(
+                "Content-Range" to "bytes */$length",
+                "Content-Length" to "0",
+            )
+            writeResponse(output, 416, "Range Not Satisfiable", headers, null)
+            return
+        }
+        val responseOffset = requestedRange?.start ?: 0L
+        val responseLength = requestedRange?.length ?: length
         val headers = linkedMapOf(
             "Content-Type" to "application/octet-stream",
-            "Content-Length" to length.toString(),
+            "Content-Length" to responseLength.toString(),
+            "ETag" to buildEtag(node),
+            "Accept-Ranges" to "bytes",
         )
-        writeResponseHeaders(output, 200, "OK", headers)
+        if (requestedRange != null) {
+            headers["Content-Range"] = "bytes ${requestedRange.start}-${requestedRange.endInclusive}/$length"
+        }
+        writeResponseHeaders(output, if (requestedRange != null) 206 else 200, if (requestedRange != null) "Partial Content" else "OK", headers)
         if (!sendBody) {
             output.flush()
             return
         }
 
         openInputStream(node).use { stream ->
-            stream.copyTo(output)
+            skipFully(stream, responseOffset)
+            copyExactly(stream, output, responseLength)
         }
         output.flush()
+    }
+
+    private fun handleApiMeta(output: BufferedOutputStream, request: WebDavRequest) {
+        val targetPath = parseQueryParams(request.query)["path"].orEmpty().ifBlank { "/" }
+        val node = resolvePath(targetPath)
+        if (!node.exists) {
+            writeSimpleResponse(output, 404, "Not Found", "text/plain; charset=utf-8", "ok=0\nerror=not_found\n".toByteArray(StandardCharsets.UTF_8))
+            return
+        }
+
+        val body = buildString {
+            append("ok=1\n")
+            append("directory=").append(if (node.isDirectory) "1" else "0").append('\n')
+            append("size=").append(node.contentLength().coerceAtLeast(0L)).append('\n')
+            append("lastModified=").append(node.lastModified().coerceAtLeast(0L)).append('\n')
+            append("writable=").append(if (node.isWritable) "1" else "0").append('\n')
+            append("name=").append(Uri.encode(node.displayName)).append('\n')
+            append("etag=").append(Uri.encode(buildEtag(node))).append('\n')
+        }.toByteArray(StandardCharsets.UTF_8)
+        writeResponse(
+            output,
+            200,
+            "OK",
+            linkedMapOf(
+                "Content-Type" to "text/plain; charset=utf-8",
+                "Content-Length" to body.size.toString(),
+            ),
+            body,
+        )
+    }
+
+    private fun handleApiList(output: BufferedOutputStream, request: WebDavRequest) {
+        val targetPath = parseQueryParams(request.query)["path"].orEmpty().ifBlank { "/" }
+        val node = resolvePath(targetPath)
+        if (!node.exists) {
+            writeSimpleResponse(output, 404, "Not Found", "text/plain; charset=utf-8", "ok=0\nerror=not_found\n".toByteArray(StandardCharsets.UTF_8))
+            return
+        }
+        if (!node.isDirectory) {
+            writeSimpleResponse(output, 409, "Conflict", "text/plain; charset=utf-8", "ok=0\nerror=not_directory\n".toByteArray(StandardCharsets.UTF_8))
+            return
+        }
+
+        val body = buildString {
+            append("ok=1\n")
+            listChildren(node).forEach { child ->
+                append("entry=")
+                append(Uri.encode(child.displayName))
+                append('\t')
+                append(if (child.isDirectory) "1" else "0")
+                append('\t')
+                append(child.contentLength().coerceAtLeast(0L))
+                append('\t')
+                append(child.lastModified().coerceAtLeast(0L))
+                append('\t')
+                append(if (child.isWritable) "1" else "0")
+                append('\n')
+            }
+        }.toByteArray(StandardCharsets.UTF_8)
+        writeResponse(
+            output,
+            200,
+            "OK",
+            linkedMapOf(
+                "Content-Type" to "text/plain; charset=utf-8",
+                "Content-Length" to body.size.toString(),
+            ),
+            body,
+        )
+    }
+
+    private fun buildDirectoryListingHtml(node: ResolvedNode): String {
+        val children = listChildren(node)
+        val title = if (node.isVirtualRoot) "/" else node.displayName
+        return buildString {
+            append("<!DOCTYPE html><html><head><meta charset=\"utf-8\">")
+            append("<title>").append(escapeXml(title)).append("</title>")
+            append("<style>")
+            append("body{font-family:Segoe UI,Arial,sans-serif;margin:24px;line-height:1.4;}")
+            append("h1{font-size:20px;margin:0 0 16px;}ul{list-style:none;padding:0;margin:0;}")
+            append("li{margin:6px 0;}a{text-decoration:none;}a:hover{text-decoration:underline;}")
+            append(".meta{color:#666;font-size:12px;margin-left:8px;}")
+            append("</style></head><body>")
+            append("<h1>").append(escapeXml(title)).append("</h1>")
+            append("<ul>")
+            buildParentLink(node)?.let { parentHref ->
+                append("<li><a href=\"").append(escapeXml(parentHref)).append("\">..</a></li>")
+            }
+            children.forEach { child ->
+                val href = buildHref(child)
+                append("<li><a href=\"").append(escapeXml(href)).append("\">")
+                append(escapeXml(child.displayName))
+                if (child.isDirectory) {
+                    append("/")
+                }
+                append("</a>")
+                if (!child.isDirectory) {
+                    append("<span class=\"meta\">").append(child.contentLength().coerceAtLeast(0L)).append(" bytes</span>")
+                }
+                append("</li>")
+            }
+            append("</ul></body></html>")
+        }
+    }
+
+    private fun buildParentLink(node: ResolvedNode): String? {
+        if (node.isVirtualRoot || node.segments.isEmpty()) {
+            return null
+        }
+        val parentSegments = node.segments.dropLast(1)
+        return if (parentSegments.isEmpty()) {
+            "/"
+        } else {
+            val encodedSegments = parentSegments.joinToString("/") { Uri.encode(it) }
+            "/$encodedSegments/"
+        }
     }
 
     private fun handlePut(output: BufferedOutputStream, request: WebDavRequest, input: InputStream) {
@@ -501,6 +676,7 @@ class AndroidWebDavServer(
         return WebDavRequest(
             method = parts[0].uppercase(Locale.US),
             path = normalizeRequestPath(parts[1]),
+            query = parts[1].substringAfter('?', ""),
             headers = headers,
             contentLength = headers["content-length"]?.toIntOrNull() ?: 0,
         )
@@ -680,11 +856,15 @@ class AndroidWebDavServer(
         }
     }
 
-    private fun buildMultiStatusXml(target: ResolvedNode, includeChildren: Boolean): String {
-        val responses = mutableListOf(renderPropResponse(target))
+    private fun buildMultiStatusXml(
+        target: ResolvedNode,
+        includeChildren: Boolean,
+        requestBaseUrl: String,
+    ): String {
+        val responses = mutableListOf(renderPropResponse(target, requestBaseUrl))
         if (includeChildren && target.isDirectory) {
             listChildren(target).forEach { child ->
-                responses += renderPropResponse(child)
+                responses += renderPropResponse(child, requestBaseUrl)
             }
         }
         return buildString {
@@ -695,9 +875,9 @@ class AndroidWebDavServer(
         }
     }
 
-    private fun renderPropResponse(node: ResolvedNode): String {
+    private fun renderPropResponse(node: ResolvedNode, requestBaseUrl: String): String {
         val isCollection = node.isDirectory
-        val href = buildHref(node)
+        val href = buildAbsoluteHref(node, requestBaseUrl)
         val contentLength = if (isCollection) {
             ""
         } else {
@@ -707,6 +887,11 @@ class AndroidWebDavServer(
             ""
         } else {
             "<D:getcontenttype>application/octet-stream</D:getcontenttype>"
+        }
+        val etag = if (isCollection) {
+            ""
+        } else {
+            "<D:getetag>${escapeXml(buildEtag(node))}</D:getetag>"
         }
         val resourceType = if (isCollection) {
             "<D:resourcetype><D:collection/></D:resourcetype>"
@@ -725,9 +910,12 @@ class AndroidWebDavServer(
             append(resourceType)
             append(contentLength)
             append(contentType)
+            append(etag)
+            append("<D:iscollection>").append(if (isCollection) "1" else "0").append("</D:iscollection>")
             append("<D:getlastmodified>").append(escapeXml(formatRfc1123(node.lastModified()))).append("</D:getlastmodified>")
             append("<D:creationdate>").append(escapeXml(formatIso8601(node.lastModified()))).append("</D:creationdate>")
             append("<D:isreadonly>").append(readOnly).append("</D:isreadonly>")
+            append("<D:ishidden>0</D:ishidden>")
             append(lockSupport)
             append("<D:lockdiscovery/>")
             append("</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat>")
@@ -741,6 +929,86 @@ class AndroidWebDavServer(
         }
         val encodedSegments = node.segments.joinToString("/") { Uri.encode(it) }
         return if (node.isDirectory) "/$encodedSegments/" else "/$encodedSegments"
+    }
+
+    private fun buildAbsoluteHref(node: ResolvedNode, requestBaseUrl: String): String {
+        val relativeHref = buildHref(node)
+        if (requestBaseUrl.isBlank()) {
+            return relativeHref
+        }
+        return if (relativeHref == "/") {
+            "$requestBaseUrl/"
+        } else {
+            requestBaseUrl + relativeHref
+        }
+    }
+
+    private fun buildRequestBaseUrl(request: WebDavRequest): String {
+        val host = request.headers["host"].orEmpty().trim()
+        if (host.isBlank()) {
+            return ""
+        }
+        return "http://$host"
+    }
+
+    private fun buildEtag(node: ResolvedNode): String {
+        return "\"${node.lastModified()}-${node.contentLength().coerceAtLeast(0L)}\""
+    }
+
+    private fun parseQueryParams(query: String): Map<String, String> {
+        if (query.isBlank()) {
+            return emptyMap()
+        }
+        return query.split('&')
+            .mapNotNull { part ->
+                if (part.isBlank()) {
+                    return@mapNotNull null
+                }
+                val separator = part.indexOf('=')
+                val key = if (separator >= 0) part.substring(0, separator) else part
+                val value = if (separator >= 0) part.substring(separator + 1) else ""
+                URLDecoder.decode(key, StandardCharsets.UTF_8.name()) to
+                    URLDecoder.decode(value, StandardCharsets.UTF_8.name())
+            }
+            .toMap()
+    }
+
+    private fun parseByteRange(headerValue: String, length: Long): ByteRange? {
+        if (!headerValue.startsWith("bytes=", ignoreCase = true) || length < 0L) {
+            return null
+        }
+        val rangeValue = headerValue.substringAfter('=').trim()
+        val separator = rangeValue.indexOf('-')
+        if (separator < 0) {
+            return null
+        }
+        val startValue = rangeValue.substring(0, separator).trim()
+        val endValue = rangeValue.substring(separator + 1).trim()
+        if (startValue.isEmpty()) {
+            val suffixLength = endValue.toLongOrNull() ?: return null
+            if (suffixLength <= 0L) {
+                return null
+            }
+            val boundedSuffix = minOf(suffixLength, length)
+            return ByteRange(
+                start = (length - boundedSuffix).coerceAtLeast(0L),
+                endInclusive = (length - 1L).coerceAtLeast(0L),
+            )
+        }
+
+        val start = startValue.toLongOrNull() ?: return null
+        if (start < 0L || start >= length) {
+            return null
+        }
+        val end = if (endValue.isEmpty()) {
+            length - 1L
+        } else {
+            minOf(endValue.toLongOrNull() ?: return null, length - 1L)
+        }
+        if (end < start) {
+            return null
+        }
+        return ByteRange(start = start, endInclusive = end)
     }
 
     private fun openInputStream(node: ResolvedNode): InputStream {
@@ -859,6 +1127,8 @@ class AndroidWebDavServer(
     ) {
         val headerBuilder = StringBuilder()
         headerBuilder.append("HTTP/1.1 ").append(statusCode).append(' ').append(reason).append("\r\n")
+        headerBuilder.append("Date: ").append(formatRfc1123(System.currentTimeMillis())).append("\r\n")
+        headerBuilder.append("Server: WiFiDrop-WebDAV/1.0\r\n")
         headers.forEach { (key, value) ->
             headerBuilder.append(key).append(": ").append(value).append("\r\n")
         }
@@ -893,6 +1163,22 @@ class AndroidWebDavServer(
             }
             output.write(buffer, 0, read)
             remaining -= read.toLong()
+        }
+    }
+
+    private fun skipFully(input: InputStream, byteCount: Long) {
+        var remaining = byteCount
+        while (remaining > 0) {
+            val skipped = input.skip(remaining)
+            if (skipped > 0) {
+                remaining -= skipped
+                continue
+            }
+            val value = input.read()
+            if (value < 0) {
+                throw EOFException("Input stream ended before requested offset")
+            }
+            remaining--
         }
     }
 
@@ -975,12 +1261,23 @@ class AndroidWebDavServer(
     private data class WebDavRequest(
         val method: String,
         val path: String,
+        val query: String,
         val headers: Map<String, String>,
         val contentLength: Int,
     )
 
+    private data class ByteRange(
+        val start: Long,
+        val endInclusive: Long,
+    ) {
+        val length: Long
+            get() = endInclusive - start + 1L
+    }
+
     private companion object {
         const val LOG_TAG = "WiFiDrop"
         const val SOCKET_TIMEOUT_MS = 10_000
+        const val API_META_PATH = "/.wifidropfs/meta"
+        const val API_LIST_PATH = "/.wifidropfs/list"
     }
 }

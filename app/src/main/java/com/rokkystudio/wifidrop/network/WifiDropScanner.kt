@@ -34,6 +34,8 @@ class WifiDropScanner {
     fun scan(
         wifiInfo: WifiNetworkProvider.WifiNetworkInfo,
         onProgress: ((ScanProgress) -> Unit)? = null,
+        onServerFound: ((List<WindowsServer>) -> Unit)? = null,
+        shouldContinue: (() -> Boolean)? = null,
     ): List<WindowsServer> {
         val candidateHosts = buildCandidateHosts(wifiInfo.ipv4Address, wifiInfo.prefixLength)
         if (candidateHosts.size > MAX_SCAN_HOSTS) {
@@ -55,9 +57,18 @@ class WifiDropScanner {
         try {
             val futures = ArrayList<Future<*>>(candidateHosts.size)
             for (host in candidateHosts) {
+                if (shouldContinue?.invoke() == false) {
+                    break
+                }
                 futures += executor.submit {
+                    if (shouldContinue?.invoke() == false) {
+                        return@submit
+                    }
                     fetchServer(client, host)?.let { server ->
-                        results.putIfAbsent(server.host, server)
+                        val existing = results.putIfAbsent(server.host, server)
+                        if (existing == null) {
+                            onServerFound?.invoke(results.values.sortedWith(compareBy({ it.deviceName.lowercase() }, { it.host })))
+                        }
                     }
                     onProgress?.invoke(
                         ScanProgress(
@@ -69,7 +80,13 @@ class WifiDropScanner {
                     )
                 }
             }
-            futures.forEach { it.get() }
+            futures.forEach { future ->
+                if (shouldContinue?.invoke() == false) {
+                    future.cancel(true)
+                } else {
+                    future.get()
+                }
+            }
         } catch (throwable: Throwable) {
             throw throwable.toWiFiDropError(
                 WiFiDropError.UnknownError("Не удалось завершить поиск серверов WiFiDrop"),

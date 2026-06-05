@@ -16,8 +16,16 @@
     <string name="main_status_disconnected_detail">The Android device is no longer published to the Windows app.</string>
     <string name="main_status_error_title">Connection failed</string>
     <string name="main_action_disconnect">Disconnect</string>
+    <string name="service_action_disconnect">Disconnect</string>
+    <string name="service_notification_channel_name">WiFiDrop connection</string>
+    <string name="service_notification_channel_description">Keeps the Android storage connection available for Windows.</string>
+    <string name="service_notification_connecting_title">WiFiDrop is connecting</string>
+    <string name="service_notification_connecting_text">Connecting to %1$s and starting WebDAV.</string>
+    <string name="service_notification_connected_title">WiFiDrop is active</string>
+    <string name="service_notification_connected_text">Android storage is connected to %1$s.</string>
     <string name="main_storage_roots_title">Storage roots</string>
-    <string name="main_error_no_storage_roots_ready">Grant access to at least one storage root before connecting to Windows.</string>
+    <string name="main_error_no_storage_roots_ready">Grant all files access before connecting to Windows.</string>
+    <string name="main_storage_access_denied">All files access was not granted. WiFiDrop will close.</string>
     <string name="main_stats_wifi_ip">Wi-Fi IP: %1$s</string>
     <string name="main_stats_prefix">Prefix: /%1$d</string>
     <string name="main_stats_port">Scan port: %1$d</string>
@@ -38,7 +46,7 @@
     <string name="storage_state_ready_rw">read-write ready</string>
     <string name="storage_state_ready_ro">read-only ready</string>
     <string name="storage_state_needs_all_files">grant all files access</string>
-    <string name="storage_state_needs_tree_grant">grant storage access</string>
+    <string name="storage_state_needs_tree_grant">grant all files access</string>
     <string name="storage_state_unavailable">storage is unavailable</string>
     <string name="share_activity_title">WiFiDrop Share</string>
     <string name="share_status_preparing">Preparing transfer…</string>

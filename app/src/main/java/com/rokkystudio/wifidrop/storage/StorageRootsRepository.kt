@@ -7,9 +7,7 @@ import android.os.Build
 import android.os.Environment
 import android.os.storage.StorageManager
 import android.os.storage.StorageVolume
-import android.provider.DocumentsContract
 import android.provider.Settings
-import androidx.documentfile.provider.DocumentFile
 import com.rokkystudio.wifidrop.R
 import java.io.File
 import java.util.Locale
@@ -38,7 +36,6 @@ data class StorageRootEntry(
     val accessState: StorageAccessState,
     val isWritable: Boolean,
     val volumeId: String? = null,
-    val storageVolume: StorageVolume? = null,
     val treeUri: Uri? = null,
     val directPath: String? = null,
 )
@@ -54,38 +51,24 @@ data class PublishedStorageRoot(
 
 /**
  * Управляет доступными корнями хранилищ Android, которые публикуются через WebDAV.
- * Internal storage идёт через direct file access, removable volumes - через SAF grants.
+ * Internal storage и removable volumes публикуются через direct file access
+ * после выдачи MANAGE_EXTERNAL_STORAGE.
  */
 class StorageRootsRepository(
     context: Context,
 ) {
     private val appContext = context.applicationContext
-    private val preferences = appContext.getSharedPreferences(PREFERENCES_NAME, Context.MODE_PRIVATE)
     private val storageManager = appContext.getSystemService(StorageManager::class.java)
 
     fun listRoots(): List<StorageRootEntry> {
         val entries = mutableListOf<StorageRootEntry>()
         entries += buildInternalRoot()
 
-        val persistedTreesByVolumeId = loadPersistedTrees().associateBy { it.volumeId }
-        val matchedVolumeIds = linkedSetOf<String>()
-
         storageManager?.storageVolumes
             .orEmpty()
             .filter { !it.isPrimary && it.isRemovable }
             .forEach { volume ->
-                val volumeId = volume.uuid?.lowercase(Locale.US)
-                val persistedTree = volumeId?.let { persistedTreesByVolumeId[it] }
-                if (volumeId != null) {
-                    matchedVolumeIds += volumeId
-                }
-                entries += buildRemovableRoot(volume, persistedTree)
-            }
-
-        loadPersistedTrees()
-            .filterNot { it.volumeId in matchedVolumeIds }
-            .forEach { persistedTree ->
-                entries += buildDetachedTreeRoot(persistedTree)
+                entries += buildRemovableRoot(volume)
             }
 
         return makeDisplayNamesUnique(entries)
@@ -117,44 +100,20 @@ class StorageRootsRepository(
             }
     }
 
-    fun saveTreeUri(treeUri: Uri) {
-        val documentId = DocumentsContract.getTreeDocumentId(treeUri)
-        val volumeId = documentId.substringBefore(':').lowercase(Locale.US)
-        val current = preferences.getStringSet(KEY_TREE_URIS, emptySet()).orEmpty().toMutableSet()
-        current.removeIf { existing ->
-            runCatching {
-                DocumentsContract.getTreeDocumentId(Uri.parse(existing))
-                    .substringBefore(':')
-                    .lowercase(Locale.US) == volumeId
-            }.getOrDefault(false)
-        }
-        current += treeUri.toString()
-        preferences.edit().putStringSet(KEY_TREE_URIS, current).apply()
-    }
-
     fun hasAllFilesAccess(): Boolean {
         return Build.VERSION.SDK_INT < Build.VERSION_CODES.R || Environment.isExternalStorageManager()
     }
 
     fun buildManageAllFilesAccessIntent(): Intent {
-        return Intent(
+        val packageIntent = Intent(
             Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
             Uri.parse("package:${appContext.packageName}"),
         )
-    }
-
-    fun buildGrantTreeIntent(entry: StorageRootEntry): Intent {
-        val intent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && entry.storageVolume != null) {
-            entry.storageVolume.createOpenDocumentTreeIntent()
+        return if (packageIntent.resolveActivity(appContext.packageManager) != null) {
+            packageIntent
         } else {
-            Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
+            Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
         }
-        intent.addFlags(
-            Intent.FLAG_GRANT_READ_URI_PERMISSION or
-                Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
-                Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION,
-        )
-        return intent
     }
 
     private fun buildInternalRoot(): StorageRootEntry {
@@ -176,66 +135,28 @@ class StorageRootsRepository(
 
     private fun buildRemovableRoot(
         volume: StorageVolume,
-        persistedTree: PersistedTree?,
     ): StorageRootEntry {
         val volumeId = volume.uuid?.lowercase(Locale.US)
         val label = volume.getDescription(appContext)
             ?.takeIf { it.isNotBlank() }
             ?: appContext.getString(R.string.storage_root_external_fallback)
-        val document = persistedTree?.documentFile
-        val ready = document?.exists() == true && document.isDirectory
+        val rootDirectory = resolveVolumeDirectory(volume)
+        val hasAllFilesAccess = hasAllFilesAccess()
+        val ready = hasAllFilesAccess && rootDirectory?.isDirectory == true
         val accessState = when {
             ready -> StorageAccessState.READY
-            persistedTree != null -> StorageAccessState.UNAVAILABLE
-            else -> StorageAccessState.NEEDS_TREE_GRANT
+            !hasAllFilesAccess -> StorageAccessState.NEEDS_ALL_FILES_ACCESS
+            else -> StorageAccessState.UNAVAILABLE
         }
         return StorageRootEntry(
             id = "removable-${volumeId ?: label.lowercase(Locale.US)}",
             displayName = label,
             type = StorageRootType.REMOVABLE,
             accessState = accessState,
-            isWritable = ready,
+            isWritable = ready && rootDirectory?.canWrite() == true,
             volumeId = volumeId,
-            storageVolume = volume,
-            treeUri = persistedTree?.uri,
+            directPath = rootDirectory?.absolutePath,
         )
-    }
-
-    private fun buildDetachedTreeRoot(
-        persistedTree: PersistedTree,
-    ): StorageRootEntry {
-        val document = persistedTree.documentFile
-        val ready = document?.exists() == true && document.isDirectory
-        val label = document?.name
-            ?.takeIf { it.isNotBlank() }
-            ?: appContext.getString(R.string.storage_root_external_detached, persistedTree.volumeId.uppercase(Locale.US))
-        return StorageRootEntry(
-            id = "detached-${persistedTree.volumeId}",
-            displayName = label,
-            type = StorageRootType.REMOVABLE,
-            accessState = if (ready) StorageAccessState.READY else StorageAccessState.UNAVAILABLE,
-            isWritable = ready,
-            volumeId = persistedTree.volumeId,
-            treeUri = persistedTree.uri,
-        )
-    }
-
-    private fun loadPersistedTrees(): List<PersistedTree> {
-        return preferences.getStringSet(KEY_TREE_URIS, emptySet())
-            .orEmpty()
-            .mapNotNull { value ->
-                runCatching {
-                    val uri = Uri.parse(value)
-                    val volumeId = DocumentsContract.getTreeDocumentId(uri)
-                        .substringBefore(':')
-                        .lowercase(Locale.US)
-                    PersistedTree(
-                        uri = uri,
-                        volumeId = volumeId,
-                        documentFile = DocumentFile.fromTreeUri(appContext, uri),
-                    )
-                }.getOrNull()
-            }
     }
 
     private fun makeDisplayNamesUnique(entries: List<StorageRootEntry>): List<StorageRootEntry> {
@@ -252,14 +173,36 @@ class StorageRootsRepository(
         }
     }
 
-    private data class PersistedTree(
-        val uri: Uri,
-        val volumeId: String,
-        val documentFile: DocumentFile?,
-    )
+    private fun resolveVolumeDirectory(volume: StorageVolume): File? {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            volume.directory?.let { directory ->
+                if (directory.exists() && directory.isDirectory) {
+                    return directory
+                }
+            }
+        }
 
-    private companion object {
-        const val PREFERENCES_NAME = "wifidrop_storage_roots"
-        const val KEY_TREE_URIS = "tree_uris"
+        val volumeId = volume.uuid?.lowercase(Locale.US)
+        return appContext.getExternalFilesDirs(null)
+            .orEmpty()
+            .mapNotNull(::resolveVolumeRootFromAppExternalDir)
+            .firstOrNull { candidate ->
+                when {
+                    !candidate.exists() || !candidate.isDirectory -> false
+                    volumeId != null -> candidate.absolutePath.lowercase(Locale.US).contains(volumeId)
+                    else -> Environment.isExternalStorageRemovable(candidate)
+                }
+            }
+    }
+
+    private fun resolveVolumeRootFromAppExternalDir(appExternalDir: File?): File? {
+        var current = appExternalDir?.absoluteFile ?: return null
+        while (true) {
+            val parent = current.parentFile ?: return null
+            if (current.name == "Android") {
+                return parent.takeIf { it.exists() && it.isDirectory }
+            }
+            current = parent
+        }
     }
 }
